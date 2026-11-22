@@ -1,0 +1,116 @@
+name: build-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "اسم الـ tag (مثلا v0.1.0)"
+        required: true
+        default: "v0.1.0"
+      skip_binary:
+        description: "تحديث الكود بس بدون إعادة بناء الـ binary (سريع، دقيقة واحدة) - اكتب true"
+        required: false
+        default: "false"
+      tba_ref:
+        description: "اتركه فاضي (commit اختياري من tdlib/telegram-bot-api)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build bot.zip
+        run: |
+          set -euo pipefail
+          echo "${TAG#v}" > VERSION
+          zip -r bot.zip . -x ".git/*" ".github/*" "tests/*" "*__pycache__*" "*.pyc" ".gitignore"
+          sha256sum bot.zip > bot.zip.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: package
+          path: bot.zip*
+
+  binary:
+    if: ${{ github.event.inputs.skip_binary != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - name: Add swap
+        run: |
+          sudo fallocate -l 6G /mnt/swapfile && sudo chmod 600 /mnt/swapfile \
+            && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || echo "swap skipped"
+          free -h; nproc; df -h / /mnt | tail -2
+
+      - name: Build telegram-bot-api (الكود كله هنا - مفيش ملف .sh)
+        env:
+          TBA_REF_INPUT: ${{ github.event.inputs.tba_ref }}
+        run: |
+          set -euo pipefail
+          REF="${TBA_REF_INPUT:-7232881b39dfcd048a0d569f1983c5184249ee05}"
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq make git zlib1g-dev libssl-dev gperf cmake g++
+          git clone --recursive https://github.com/tdlib/telegram-bot-api.git src
+          cd src
+          git checkout "$REF"
+          git submodule update --init --recursive
+          MEM_GB="$(awk '/MemAvailable/{printf "%d", $2/1024/1024}' /proc/meminfo)"
+          JOBS="$(nproc)"; BYMEM=$(( MEM_GB / 3 ))
+          if [ "$BYMEM" -lt 1 ]; then BYMEM=1; fi
+          if [ "$JOBS" -gt "$BYMEM" ]; then JOBS="$BYMEM"; fi
+          if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
+          echo "cpu=$(nproc) mem=${MEM_GB}GB jobs=$JOBS"
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . --target telegram-bot-api -j"$JOBS"
+          strip telegram-bot-api || true
+          ./telegram-bot-api --version
+          V="${{ matrix.os }}"; V="${V#ubuntu-}"
+          cp telegram-bot-api "$GITHUB_WORKSPACE/telegram-bot-api-ubuntu-${V}"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum "telegram-bot-api-ubuntu-${V}" > "telegram-bot-api-ubuntu-${V}.sha256"
+          ls -la
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: binary-${{ matrix.os }}
+          path: telegram-bot-api-ubuntu-*
+
+  release:
+    needs: [package, binary]
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKIP_BINARY: ${{ github.event.inputs.skip_binary }}
+        run: |
+          set -euo pipefail
+          cd dist && ls -la
+          N="$(ls telegram-bot-api-ubuntu-*.sha256 2>/dev/null | wc -l)"
+          if [ "$N" -eq 0 ] && [ "${SKIP_BINARY:-false}" != "true" ]; then echo "::error::no binary was built - check the binary job"; exit 1; fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            TARGET=""
+            [ "${{ github.event_name }}" = "workflow_dispatch" ] && TARGET="--target $GITHUB_SHA"
+            gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes $TARGET
+          fi
