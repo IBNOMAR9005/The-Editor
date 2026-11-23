@@ -105,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist && ls -la
-          N="$(ls telegram-bot-api-ubuntu-*.sha256 2>/dev/null | wc -l)"
+          N="$(find . -maxdepth 1 -name 'telegram-bot-api-ubuntu-*.sha256' | wc -l)"
           if [ "$N" -eq 0 ] && [ "${SKIP_BINARY:-false}" != "true" ]; then echo "::error::no binary was built - check the binary job"; exit 1; fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
